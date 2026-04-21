@@ -90,24 +90,44 @@ def get_dashboard_data(db_path=DB_PATH):
         SELECT
             substr(timestamp, 1, 10)                   as day,
             CAST(substr(timestamp, 12, 2) AS INTEGER)  as hour,
-            COUNT(*)                                    as turns
+            COALESCE(model, 'unknown')                 as model,
+            COUNT(*)                                    as turns,
+            SUM(input_tokens)                          as input_tokens,
+            SUM(output_tokens)                         as output_tokens,
+            SUM(cache_read_tokens)                     as cache_read_tokens,
+            SUM(cache_creation_tokens)                 as cache_creation_tokens
         FROM turns
-        GROUP BY day, hour
-        ORDER BY day, hour
+        GROUP BY day, hour, model
+        ORDER BY day, hour, model
     """).fetchall()
-    hourly_data = [{"day": r["day"], "hour": r["hour"] or 0, "turns": r["turns"]} for r in hourly_rows]
+    hourly_data = [{
+        "day": r["day"], "hour": r["hour"] or 0, "model": r["model"],
+        "turns": r["turns"],
+        "input_tokens": r["input_tokens"] or 0, "output_tokens": r["output_tokens"] or 0,
+        "cache_read_tokens": r["cache_read_tokens"] or 0, "cache_creation_tokens": r["cache_creation_tokens"] or 0,
+    } for r in hourly_rows]
 
-    # ── Day-of-week activity (one row per unique date) ────────────────────────
+    # ── Day-of-week activity (per date per model for cost calc) ───────────────
     dow_rows = conn.execute("""
         SELECT
             substr(timestamp, 1, 10)                   as day,
             CAST(strftime('%w', timestamp) AS INTEGER)  as dow,
-            COUNT(*)                                    as turns
+            COALESCE(model, 'unknown')                 as model,
+            COUNT(*)                                    as turns,
+            SUM(input_tokens)                          as input_tokens,
+            SUM(output_tokens)                         as output_tokens,
+            SUM(cache_read_tokens)                     as cache_read_tokens,
+            SUM(cache_creation_tokens)                 as cache_creation_tokens
         FROM turns
-        GROUP BY day
-        ORDER BY day
+        GROUP BY day, model
+        ORDER BY day, model
     """).fetchall()
-    dow_data = [{"day": r["day"], "dow": r["dow"] or 0, "turns": r["turns"]} for r in dow_rows]
+    dow_data = [{
+        "day": r["day"], "dow": r["dow"] or 0, "model": r["model"],
+        "turns": r["turns"],
+        "input_tokens": r["input_tokens"] or 0, "output_tokens": r["output_tokens"] or 0,
+        "cache_read_tokens": r["cache_read_tokens"] or 0, "cache_creation_tokens": r["cache_creation_tokens"] or 0,
+    } for r in dow_rows]
 
     conn.close()
 
@@ -247,11 +267,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
     </div>
     <div class="chart-card">
-      <h2>Activity by Hour of Day</h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h2 style="margin-bottom:0">Activity by Hour of Day</h2>
+        <div class="range-group" id="activity-metric-toggle">
+          <button class="range-btn active" data-metric="turns" onclick="setActivityMetric('turns')">Turns</button>
+          <button class="range-btn" data-metric="cost" onclick="setActivityMetric('cost')">Cost</button>
+        </div>
+      </div>
       <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
     </div>
     <div class="chart-card">
-      <h2>Activity by Day of Week <span style="font-size:11px;font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">avg turns per occurrence</span></h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h2 style="margin-bottom:0">Activity by Day of Week <span id="dow-metric-label" style="font-size:11px;font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">avg turns per occurrence</span></h2>
+      </div>
       <div class="chart-wrap"><canvas id="chart-dow"></canvas></div>
     </div>
   </div>
@@ -338,6 +366,7 @@ let lastFilteredSessions = [];
 let lastByProject = [];
 let sessionSortDir = 'desc';
 let selectedDay = null;
+let activityMetric = 'turns';
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
 const PRICING = {
@@ -890,14 +919,33 @@ function exportProjectsCSV() {
   downloadCSV('projects', header, rows);
 }
 
+// ── Activity metric toggle ─────────────────────────────────────────────────
+function setActivityMetric(metric) {
+  activityMetric = metric;
+  document.querySelectorAll('#activity-metric-toggle .range-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.metric === metric)
+  );
+  const label = metric === 'cost' ? 'avg cost per occurrence' : 'avg turns per occurrence';
+  document.getElementById('dow-metric-label').textContent = label;
+  if (rawData) {
+    const cutoff = getRangeCutoff(selectedRange);
+    renderHourlyChart(rawData.hourly_data, cutoff);
+    renderDowChart(rawData.dow_data, cutoff);
+  }
+}
+
 // ── Hourly chart ──────────────────────────────────────────────────────────
 function renderHourlyChart(hourlyData, cutoff) {
   const hourTurns = new Array(24).fill(0);
+  const hourCost  = new Array(24).fill(0);
   for (const r of hourlyData) {
     if (!cutoff || r.day >= cutoff) {
-      hourTurns[r.hour] = (hourTurns[r.hour] || 0) + r.turns;
+      hourTurns[r.hour] += r.turns;
+      hourCost[r.hour]  += calcCost(r.model, r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens);
     }
   }
+  const isCost = activityMetric === 'cost';
+  const data   = isCost ? hourCost.map(v => +v.toFixed(4)) : hourTurns;
   const labels = Array.from({length: 24}, (_, i) => {
     if (i === 0) return '12am';
     if (i < 12) return i + 'am';
@@ -910,14 +958,17 @@ function renderHourlyChart(hourlyData, cutoff) {
     type: 'bar',
     data: {
       labels,
-      datasets: [{ label: 'Turns', data: hourTurns, backgroundColor: 'rgba(79,142,247,0.7)', borderRadius: 3 }]
+      datasets: [{ label: isCost ? 'Est. Cost' : 'Turns', data, backgroundColor: 'rgba(79,142,247,0.7)', borderRadius: 3 }]
     },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw} turns` } } },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => isCost ? ` $${ctx.raw}` : ` ${ctx.raw} turns` } }
+      },
       scales: {
         x: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
-        y: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4', callback: v => isCost ? '$' + v.toFixed(2) : v }, grid: { color: '#2a2d3a' } },
       }
     }
   });
@@ -925,20 +976,26 @@ function renderHourlyChart(hourlyData, cutoff) {
 
 // ── Day-of-week chart ─────────────────────────────────────────────────────
 function renderDowChart(dowData, cutoff) {
-  // DOW order: Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6, Sun=0
-  const DOW_ORDER = [1, 2, 3, 4, 5, 6, 0];
+  const DOW_ORDER  = [1, 2, 3, 4, 5, 6, 0];
   const DOW_LABELS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const dowTurns = new Array(7).fill(0);
-  const dowDays  = new Array(7).fill(0);
+  const dowCost  = new Array(7).fill(0);
+  const dowDays  = Array.from({length: 7}, () => new Set());
   for (const r of dowData) {
     if (!cutoff || r.day >= cutoff) {
       dowTurns[r.dow] += r.turns;
-      dowDays[r.dow]++;
+      dowCost[r.dow]  += calcCost(r.model, r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens);
+      dowDays[r.dow].add(r.day);
     }
   }
-  const avgTurns = DOW_ORDER.map(i => dowDays[i] > 0 ? Math.round(dowTurns[i] / dowDays[i]) : 0);
-  const maxVal = Math.max(...avgTurns, 1);
-  const bgColors = avgTurns.map(v => {
+  const isCost = activityMetric === 'cost';
+  const vals = DOW_ORDER.map(i => {
+    const count = dowDays[i].size;
+    if (!count) return 0;
+    return isCost ? +(dowCost[i] / count).toFixed(4) : Math.round(dowTurns[i] / count);
+  });
+  const maxVal = Math.max(...vals, 1);
+  const bgColors = vals.map(v => {
     const intensity = v / maxVal;
     return `rgba(217,119,87,${0.3 + intensity * 0.6})`;
   });
@@ -948,22 +1005,17 @@ function renderDowChart(dowData, cutoff) {
     type: 'bar',
     data: {
       labels: DOW_LABELS,
-      datasets: [{
-        label: 'Avg Turns',
-        data: avgTurns,
-        backgroundColor: bgColors,
-        borderRadius: 4,
-      }]
+      datasets: [{ label: isCost ? 'Avg Cost' : 'Avg Turns', data: vals, backgroundColor: bgColors, borderRadius: 4 }]
     },
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: ctx => ` ${ctx.raw} avg turns` } }
+        tooltip: { callbacks: { label: ctx => isCost ? ` $${ctx.raw} avg cost` : ` ${ctx.raw} avg turns` } }
       },
       scales: {
         x: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
-        y: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4', callback: v => isCost ? '$' + v.toFixed(2) : v }, grid: { color: '#2a2d3a' } },
       }
     }
   });
