@@ -97,6 +97,18 @@ def get_dashboard_data(db_path=DB_PATH):
     """).fetchall()
     hourly_data = [{"day": r["day"], "hour": r["hour"] or 0, "turns": r["turns"]} for r in hourly_rows]
 
+    # ── Day-of-week activity (one row per unique date) ────────────────────────
+    dow_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)                   as day,
+            CAST(strftime('%w', timestamp) AS INTEGER)  as dow,
+            COUNT(*)                                    as turns
+        FROM turns
+        GROUP BY day
+        ORDER BY day
+    """).fetchall()
+    dow_data = [{"day": r["day"], "dow": r["dow"] or 0, "turns": r["turns"]} for r in dow_rows]
+
     conn.close()
 
     return {
@@ -104,6 +116,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
         "hourly_data":    hourly_data,
+        "dow_data":       dow_data,
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -233,9 +246,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2>Top Projects by Tokens</h2>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
     </div>
-    <div class="chart-card wide">
+    <div class="chart-card">
       <h2>Activity by Hour of Day</h2>
       <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h2>Activity by Day of Week <span style="font-size:11px;font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">avg turns per occurrence</span></h2>
+      <div class="chart-wrap"><canvas id="chart-dow"></canvas></div>
     </div>
   </div>
   <div class="table-card">
@@ -604,6 +621,7 @@ function applyFilter() {
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderHourlyChart(rawData.hourly_data, cutoff);
+  renderDowChart(rawData.dow_data, cutoff);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByProject = sortProjects(byProject);
   selectedDay = null;
@@ -897,6 +915,52 @@ function renderHourlyChart(hourlyData, cutoff) {
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw} turns` } } },
+      scales: {
+        x: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+      }
+    }
+  });
+}
+
+// ── Day-of-week chart ─────────────────────────────────────────────────────
+function renderDowChart(dowData, cutoff) {
+  // DOW order: Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6, Sun=0
+  const DOW_ORDER = [1, 2, 3, 4, 5, 6, 0];
+  const DOW_LABELS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  const dowTurns = new Array(7).fill(0);
+  const dowDays  = new Array(7).fill(0);
+  for (const r of dowData) {
+    if (!cutoff || r.day >= cutoff) {
+      dowTurns[r.dow] += r.turns;
+      dowDays[r.dow]++;
+    }
+  }
+  const avgTurns = DOW_ORDER.map(i => dowDays[i] > 0 ? Math.round(dowTurns[i] / dowDays[i]) : 0);
+  const maxVal = Math.max(...avgTurns, 1);
+  const bgColors = avgTurns.map(v => {
+    const intensity = v / maxVal;
+    return `rgba(217,119,87,${0.3 + intensity * 0.6})`;
+  });
+  const ctx = document.getElementById('chart-dow').getContext('2d');
+  if (charts.dow) charts.dow.destroy();
+  charts.dow = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: DOW_LABELS,
+      datasets: [{
+        label: 'Avg Turns',
+        data: avgTurns,
+        backgroundColor: bgColors,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.raw} avg turns` } }
+      },
       scales: {
         x: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
         y: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
