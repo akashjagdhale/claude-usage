@@ -85,12 +85,25 @@ def get_dashboard_data(db_path=DB_PATH):
             "cache_creation": r["total_cache_creation"] or 0,
         })
 
+    # ── Hourly activity (for time-of-day chart) ──────────────────────────────
+    hourly_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)                   as day,
+            CAST(substr(timestamp, 12, 2) AS INTEGER)  as hour,
+            COUNT(*)                                    as turns
+        FROM turns
+        GROUP BY day, hour
+        ORDER BY day, hour
+    """).fetchall()
+    hourly_data = [{"day": r["day"], "hour": r["hour"] or 0, "turns": r["turns"]} for r in hourly_rows]
+
     conn.close()
 
     return {
         "all_models":     all_models,
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
+        "hourly_data":    hourly_data,
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -220,6 +233,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2>Top Projects by Tokens</h2>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
     </div>
+    <div class="chart-card wide">
+      <h2>Activity by Hour of Day</h2>
+      <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
+    </div>
   </div>
   <div class="table-card">
     <div class="section-title">Cost by Model</div>
@@ -237,7 +254,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </table>
   </div>
   <div class="table-card">
-    <div class="section-header"><div class="section-title">Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
+    <div class="section-header"><div class="section-title">Recent Sessions</div><div style="display:flex;align-items:center;gap:8px"><span id="day-filter-badge" style="display:none;background:rgba(217,119,87,0.15);border:1px solid var(--accent);color:var(--accent);padding:2px 10px;border-radius:12px;font-size:11px;cursor:pointer" onclick="clearDayFilter()"></span><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div></div>
     <table>
       <thead><tr>
         <th>Session</th>
@@ -303,6 +320,7 @@ let projectSortDir = 'desc';
 let lastFilteredSessions = [];
 let lastByProject = [];
 let sessionSortDir = 'desc';
+let selectedDay = null;
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
 const PRICING = {
@@ -569,6 +587,14 @@ function applyFilter() {
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
   };
+  totals.cache_savings = byModel.reduce((s, m) => {
+    const p = getPricing(m.model);
+    if (!p) return s;
+    return s + m.cache_read * p.input * 0.9 / 1e6;
+  }, 0);
+  const totalTokensForHitRate = totals.input + totals.cache_read + totals.cache_creation;
+  totals.cache_hit_pct = totalTokensForHitRate > 0 ? Math.round(totals.cache_read / totalTokensForHitRate * 100) : 0;
+  totals.max_plan_value = totals.cost > 0 ? (totals.cost / 100).toFixed(1) + 'x' : '\u2014';
 
   // Update daily chart title
   document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
@@ -577,9 +603,11 @@ function applyFilter() {
   renderDailyChart(daily);
   renderModelChart(byModel);
   renderProjectChart(byProject);
+  renderHourlyChart(rawData.hourly_data, cutoff);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByProject = sortProjects(byProject);
-  renderSessionsTable(lastFilteredSessions.slice(0, 20));
+  selectedDay = null;
+  updateDayFilter();
   renderModelCostTable(byModel);
   renderProjectCostTable(lastByProject.slice(0, 20));
 }
@@ -592,9 +620,11 @@ function renderStats(t) {
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
     { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
     { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
-    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
+    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: t.cache_hit_pct + '% of tokens from cache' },
+    { label: 'Cache Savings',  value: fmtCostBig(t.cache_savings), sub: 'saved vs full input pricing', color: '#4ade80' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
     { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Max Plan Value', value: t.max_plan_value,            sub: 'vs $100/mo plan', color: '#fbbf24' },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
@@ -625,7 +655,17 @@ function renderDailyChart(daily) {
       scales: {
         x: { ticks: { color: '#8892a4', maxTicksLimit: RANGE_TICKS[selectedRange] }, grid: { color: '#2a2d3a' } },
         y: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
-      }
+      },
+      onClick: (evt, elements) => {
+        if (elements.length > 0) {
+          const day = daily[elements[0].index].day;
+          selectedDay = selectedDay === day ? null : day;
+          updateDayFilter();
+        }
+      },
+      onHover: (evt, elements) => {
+        evt.native.target.style.cursor = elements.length > 0 ? 'pointer' : 'default';
+      },
     }
   });
 }
@@ -830,6 +870,59 @@ function exportProjectsCSV() {
     return [p.project, p.sessions, p.turns, p.input, p.output, p.cache_read, p.cache_creation, p.cost.toFixed(4)];
   });
   downloadCSV('projects', header, rows);
+}
+
+// ── Hourly chart ──────────────────────────────────────────────────────────
+function renderHourlyChart(hourlyData, cutoff) {
+  const hourTurns = new Array(24).fill(0);
+  for (const r of hourlyData) {
+    if (!cutoff || r.day >= cutoff) {
+      hourTurns[r.hour] = (hourTurns[r.hour] || 0) + r.turns;
+    }
+  }
+  const labels = Array.from({length: 24}, (_, i) => {
+    if (i === 0) return '12am';
+    if (i < 12) return i + 'am';
+    if (i === 12) return '12pm';
+    return (i - 12) + 'pm';
+  });
+  const ctx = document.getElementById('chart-hourly').getContext('2d');
+  if (charts.hourly) charts.hourly.destroy();
+  charts.hourly = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ label: 'Turns', data: hourTurns, backgroundColor: 'rgba(79,142,247,0.7)', borderRadius: 3 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw} turns` } } },
+      scales: {
+        x: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+      }
+    }
+  });
+}
+
+// ── Day drill-down ────────────────────────────────────────────────────────
+function updateDayFilter() {
+  const badge = document.getElementById('day-filter-badge');
+  let sessions = lastFilteredSessions;
+  if (selectedDay) {
+    sessions = sessions.filter(s => s.last_date === selectedDay);
+    badge.textContent = selectedDay + ' \u00d7';
+    badge.style.display = 'inline';
+    renderSessionsTable(sessions);
+  } else {
+    badge.style.display = 'none';
+    renderSessionsTable(sessions.slice(0, 20));
+  }
+}
+
+function clearDayFilter() {
+  selectedDay = null;
+  updateDayFilter();
 }
 
 // ── Rescan ────────────────────────────────────────────────────────────────
