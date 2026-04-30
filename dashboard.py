@@ -147,7 +147,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Usage Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g" crossorigin="anonymous"></script>
 <style>
   :root {
     --bg: #0f1117;
@@ -333,11 +333,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank" rel="noopener noreferrer">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
-      GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
+      GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank" rel="noopener noreferrer">https://github.com/phuryn/claude-usage</a>
       &nbsp;&middot;&nbsp;
-      Created by: <a href="https://www.productcompass.pm" target="_blank">The Product Compass Newsletter</a>
+      Created by: <a href="https://www.productcompass.pm" target="_blank" rel="noopener noreferrer">The Product Compass Newsletter</a>
       &nbsp;&middot;&nbsp;
       License: MIT
     </p>
@@ -1103,10 +1103,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _send_security_headers(self):
+        """Attach security headers to every response."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'"
+        )
+
+    def _is_local_origin(self):
+        """Return True only if the request comes from the local dashboard."""
+        origin = self.headers.get("Origin", "")
+        referer = self.headers.get("Referer", "")
+        host_header = self.headers.get("Host", "")
+        allowed = {f"http://{host_header}", f"https://{host_header}"}
+        # Accept if Origin matches, or if no Origin but Referer starts with our host,
+        # or if there is neither (e.g. curl from localhost).
+        if origin:
+            return origin in allowed
+        if referer:
+            return any(referer.startswith(a) for a in allowed)
+        return True  # no Origin/Referer → assume same-origin CLI/curl call
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
@@ -1116,6 +1145,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -1125,6 +1155,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/rescan":
+            # CSRF guard: reject requests that don't originate from this dashboard
+            if not self._is_local_origin():
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "Forbidden"}')
+                return
             # Full rebuild: delete DB and rescan from scratch
             if DB_PATH.exists():
                 DB_PATH.unlink()
@@ -1134,6 +1171,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
         else:
@@ -1143,7 +1181,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
-    port = port or int(os.environ.get("PORT", "8080"))
+    try:
+        port = port or int(os.environ.get("PORT", "8080"))
+    except ValueError:
+        print(f"⚠️  Invalid PORT value '{os.environ.get('PORT')}' — defaulting to 8080.")
+        port = 8080
+    if host not in ("localhost", "127.0.0.1", "::1"):
+        print(
+            f"⚠️  WARNING: Dashboard is binding to {host!r} — it will be reachable "
+            "over the network with no authentication. Set HOST=localhost to restrict "
+            "access to this machine only."
+        )
     server = HTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
