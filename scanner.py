@@ -10,6 +10,33 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+PRICING = {
+    "claude-opus-4-6":   {"input": 5.00,  "output": 25.00, "cache_write": 6.25,  "cache_read": 0.50},
+    "claude-opus-4-5":   {"input": 5.00,  "output": 25.00, "cache_write": 6.25,  "cache_read": 0.50},
+    "claude-sonnet-4-6": {"input": 3.00,  "output": 15.00, "cache_write": 3.75,  "cache_read": 0.30},
+    "claude-sonnet-4-5": {"input": 3.00,  "output": 15.00, "cache_write": 3.75,  "cache_read": 0.30},
+    "claude-haiku-4-5":  {"input": 1.00,  "output":  5.00, "cache_write": 1.25,  "cache_read": 0.10},
+    "claude-haiku-4-6":  {"input": 1.00,  "output":  5.00, "cache_write": 1.25,  "cache_read": 0.10},
+}
+
+
+def get_pricing(model):
+    if not model:
+        return None
+    if model in PRICING:
+        return PRICING[model]
+    for key in PRICING:
+        if model.startswith(key):
+            return PRICING[key]
+    m = model.lower()
+    if "opus" in m:
+        return PRICING["claude-opus-4-6"]
+    if "sonnet" in m:
+        return PRICING["claude-sonnet-4-6"]
+    if "haiku" in m:
+        return PRICING["claude-haiku-4-5"]
+    return None
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 DB_PATH = Path.home() / ".claude" / "usage.db"
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
@@ -85,12 +112,14 @@ def project_name_from_cwd(cwd):
     return parts[-1] if parts else "unknown"
 
 
-def parse_jsonl_file(filepath):
-    """Parse a JSONL file and return (session_metas, turns, line_count).
+def _parse_jsonl_lines(filepath, skip_first_n=0):
+    """Parse JSONL lines from filepath, optionally skipping the first N lines.
 
-    Deduplicates streaming events by message.id — Claude Code logs multiple
-    JSONL records per API response, all sharing the same message.id. Only the
-    last record per message_id is kept (it has the final usage tallies).
+    Returns (session_metas, turns, total_line_count).
+    Deduplicates streaming events by message.id — only the last record per
+    message_id is kept (it has the final usage tallies).
+    When skip_first_n > 0 (incremental mode), only new lines are processed
+    but the returned line_count still reflects the total lines in the file.
     """
     seen_messages = {}  # message_id -> turn dict (dedup streaming records)
     turns_no_id = []    # turns without a message_id (kept as-is)
@@ -100,6 +129,8 @@ def parse_jsonl_file(filepath):
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             for line_count, line in enumerate(f, 1):
+                if line_count <= skip_first_n:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -120,7 +151,6 @@ def parse_jsonl_file(filepath):
                 cwd = record.get("cwd", "")
                 git_branch = record.get("gitBranch", "")
 
-                # Update session metadata from any record
                 if session_id not in session_meta:
                     session_meta[session_id] = {
                         "session_id": session_id,
@@ -150,11 +180,9 @@ def parse_jsonl_file(filepath):
                     cache_read = usage.get("cache_read_input_tokens", 0) or 0
                     cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
 
-                    # Only record turns that have actual token usage
                     if input_tokens + output_tokens + cache_read + cache_creation == 0:
                         continue
 
-                    # Extract tool name from content if present
                     tool_name = None
                     for item in msg.get("content", []):
                         if isinstance(item, dict) and item.get("type") == "tool_use":
@@ -177,7 +205,6 @@ def parse_jsonl_file(filepath):
                         "message_id": message_id,
                     }
 
-                    # Dedup: last record per message_id wins (final usage tallies)
                     if message_id:
                         seen_messages[message_id] = turn
                     else:
@@ -188,6 +215,11 @@ def parse_jsonl_file(filepath):
 
     turns = turns_no_id + list(seen_messages.values())
     return list(session_meta.values()), turns, line_count
+
+
+def parse_jsonl_file(filepath):
+    """Parse a JSONL file and return (session_metas, turns, line_count)."""
+    return _parse_jsonl_lines(filepath)
 
 
 def aggregate_sessions(session_metas, turns):
@@ -341,94 +373,11 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                 new_files += 1
 
         else:
-            # Updated file: read once, process only new lines
+            # Updated file: process only new lines
             old_lines = row["lines"] if row else 0
-            seen_messages = {}  # message_id -> turn (dedup streaming)
-            turns_no_id = []
-            new_session_metas = {}
-            line_count = 0
-
-            try:
-                with open(filepath, encoding="utf-8", errors="replace") as f:
-                    for line_count, line in enumerate(f, 1):
-                        if line_count <= old_lines:
-                            continue
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        rtype = record.get("type")
-                        if rtype not in ("assistant", "user"):
-                            continue
-
-                        session_id = record.get("sessionId")
-                        if not session_id:
-                            continue
-
-                        timestamp = record.get("timestamp", "")
-                        cwd = record.get("cwd", "")
-
-                        # Track session metadata from new lines
-                        if session_id not in new_session_metas:
-                            new_session_metas[session_id] = {
-                                "session_id": session_id,
-                                "project_name": project_name_from_cwd(cwd),
-                                "first_timestamp": timestamp,
-                                "last_timestamp": timestamp,
-                                "git_branch": record.get("gitBranch", ""),
-                                "model": None,
-                            }
-                        else:
-                            meta = new_session_metas[session_id]
-                            if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                                meta["last_timestamp"] = timestamp
-
-                        if rtype == "assistant":
-                            msg = record.get("message", {})
-                            usage = msg.get("usage", {})
-                            model = msg.get("model", "")
-                            message_id = msg.get("id", "")
-
-                            input_tokens = usage.get("input_tokens", 0) or 0
-                            output_tokens = usage.get("output_tokens", 0) or 0
-                            cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                            cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-
-                            if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                                continue
-
-                            tool_name = None
-                            for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
-
-                            if model:
-                                new_session_metas[session_id]["model"] = model
-
-                            turn = {
-                                "session_id": session_id,
-                                "timestamp": timestamp,
-                                "model": model,
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_read_tokens": cache_read,
-                                "cache_creation_tokens": cache_creation,
-                                "tool_name": tool_name,
-                                "cwd": cwd,
-                                "message_id": message_id,
-                            }
-
-                            if message_id:
-                                seen_messages[message_id] = turn
-                            else:
-                                turns_no_id.append(turn)
-            except Exception as e:
-                print(f"  Warning: {e}")
+            new_session_metas, new_turns, line_count = _parse_jsonl_lines(
+                filepath, skip_first_n=old_lines
+            )
 
             if line_count <= old_lines:
                 # File didn't grow (mtime changed but no new content)
@@ -438,10 +387,8 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                 skipped_files += 1
                 continue
 
-            new_turns = turns_no_id + list(seen_messages.values())
-
             if new_turns or new_session_metas:
-                sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
+                sessions = aggregate_sessions(new_session_metas, new_turns)
                 upsert_sessions(conn, sessions)
                 insert_turns(conn, new_turns)
                 for s in sessions:
