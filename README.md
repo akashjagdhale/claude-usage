@@ -101,9 +101,19 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each lin
 
 ## Cost estimates
 
-Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.com/pricing#api](https://claude.com/pricing#api)).
+On every `scan`, the tool fetches current Anthropic API rates from the
+community-maintained [LiteLLM pricing dataset](https://github.com/BerriAI/litellm)
+(Anthropic has no official pricing API). Fetched rates are cached to
+`~/.claude/usage-pricing.json` and overlaid on the built-in defaults.
+
+If the network is unavailable, the fetch fails silently and the tool falls back
+to the cached rates, then to the built-in defaults below. Set
+`CLAUDE_USAGE_DISABLE_PRICING_FETCH=1` to skip the network entirely and always
+use the built-in rates.
 
 **Only models whose name contains `opus`, `sonnet`, or `haiku` are included in cost calculations.** Local models, unknown models, and any other model names are excluded (shown as `n/a`).
+
+Built-in fallback rates:
 
 | Model | Input | Output | Cache Write | Cache Read |
 |-------|-------|--------|------------|-----------|

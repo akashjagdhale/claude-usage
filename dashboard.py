@@ -8,8 +8,21 @@ import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from scanner import PRICING, get_effective_pricing
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+
+def _format_pricing_js(pricing):
+    """Render the Python PRICING dict as a JS object literal with single-quoted keys."""
+    items = []
+    for model, p in pricing.items():
+        items.append(
+            f"  '{model}': "
+            f"{{ input: {p['input']:.2f}, output: {p['output']:.2f}, "
+            f"cache_write: {p['cache_write']:.2f}, cache_read: {p['cache_read']:.2f} }}"
+        )
+    return '{\n' + ',\n'.join(items) + '\n}'
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -137,11 +150,12 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":   sessions_all,
         "hourly_data":    hourly_data,
         "dow_data":       dow_data,
+        "pricing":        get_effective_pricing(),
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
+_HTML_TEMPLATE_BASE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -368,15 +382,8 @@ let sessionSortDir = 'desc';
 let selectedDay = null;
 let activityMetric = 'turns';
 
-// ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
-const PRICING = {
-  'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-sonnet-4-5': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-haiku-4-5':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-  'claude-haiku-4-6':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-};
+// ── Pricing (Anthropic API, April 2026) — generated from scanner.PRICING ───
+const PRICING = __PRICING_PLACEHOLDER__;
 
 function isBillable(model) {
   if (!model) return false;
@@ -386,14 +393,18 @@ function isBillable(model) {
 
 function getPricing(model) {
   if (!model) return null;
-  if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key)) return PRICING[key];
+  // Prefer live rates fetched server-side; fall back to the built-in table.
+  const table = (rawData && rawData.pricing) ? rawData.pricing : PRICING;
+  if (table[model]) return table[model];
+  // Longest (most specific) prefix wins — the fetched table has many keys.
+  const keys = Object.keys(table).sort((a, b) => b.length - a.length);
+  for (const key of keys) {
+    if (model.startsWith(key)) return table[key];
   }
   const m = model.toLowerCase();
-  if (m.includes('opus'))   return PRICING['claude-opus-4-6'];
-  if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
-  if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
+  if (m.includes('opus'))   return table['claude-opus-4-6'] || null;
+  if (m.includes('sonnet')) return table['claude-sonnet-4-6'] || null;
+  if (m.includes('haiku'))  return table['claude-haiku-4-5'] || null;
   return null;
 }
 
@@ -638,8 +649,8 @@ function applyFilter() {
     if (!p) return s;
     return s + m.cache_read * p.input * 0.9 / 1e6;
   }, 0);
-  const totalTokensForHitRate = totals.input + totals.cache_read + totals.cache_creation;
-  totals.cache_hit_pct = totalTokensForHitRate > 0 ? Math.round(totals.cache_read / totalTokensForHitRate * 100) : 0;
+  const totalCacheableTokens = totals.input + totals.cache_read;
+  totals.cache_hit_pct = totalCacheableTokens > 0 ? Math.round(totals.cache_read / totalCacheableTokens * 100) : 0;
   totals.max_plan_value = totals.cost > 0 ? (totals.cost / 100).toFixed(1) + 'x' : '\u2014';
 
   // Update daily chart title
@@ -1098,6 +1109,10 @@ setInterval(loadData, 30000);
 </html>
 """
 
+HTML_TEMPLATE = _HTML_TEMPLATE_BASE.replace(
+    '__PRICING_PLACEHOLDER__', _format_pricing_js(PRICING)
+)
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -1162,11 +1177,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"error": "Forbidden"}')
                 return
-            # Full rebuild: delete DB and rescan from scratch
-            if DB_PATH.exists():
-                DB_PATH.unlink()
-            from scanner import scan
-            result = scan(verbose=False)
+            # Atomic rebuild: scan into a temp file, then replace the live DB
+            # so data is never lost if the scan fails mid-way.
+            tmp_path = DB_PATH.with_suffix(".tmp")
+            try:
+                from scanner import scan
+                result = scan(db_path=tmp_path, verbose=False)
+            except Exception:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                raise
+            os.replace(tmp_path, DB_PATH)
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1181,10 +1202,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
-    try:
-        port = port or int(os.environ.get("PORT", "8080"))
-    except ValueError:
-        print(f"⚠️  Invalid PORT value '{os.environ.get('PORT')}' — defaulting to 8080.")
+    if port is None:
+        try:
+            port = int(os.environ.get("PORT", "8080"))
+        except ValueError:
+            print(f"⚠️  Invalid PORT value '{os.environ.get('PORT')}' — defaulting to 8080.")
+            port = 8080
+    if not (1 <= port <= 65535):
+        print(f"⚠️  PORT {port} out of valid range — defaulting to 8080.")
         port = 8080
     if host not in ("localhost", "127.0.0.1", "::1"):
         print(

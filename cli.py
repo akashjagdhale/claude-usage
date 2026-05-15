@@ -13,45 +13,20 @@ import sys
 import sqlite3
 from pathlib import Path
 from datetime import datetime, date
+from scanner import PRICING, get_pricing
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
-PRICING = {
-    "claude-opus-4-6":   {"input":  5.00, "output": 25.00},
-    "claude-opus-4-5":   {"input":  5.00, "output": 25.00},
-    "claude-sonnet-4-6": {"input":  3.00, "output": 15.00},
-    "claude-sonnet-4-5": {"input":  3.00, "output": 15.00},
-    "claude-haiku-4-5":  {"input":  1.00, "output":  5.00},
-    "claude-haiku-4-6":  {"input":  1.00, "output":  5.00},
-}
-
-def get_pricing(model):
-    if not model:
-        return None
-    if model in PRICING:
-        return PRICING[model]
-    for key in PRICING:
-        if model.startswith(key):
-            return PRICING[key]
-    # Substring fallback: match model family by keyword
-    m = model.lower()
-    if "opus" in m:
-        return PRICING["claude-opus-4-6"]
-    if "sonnet" in m:
-        return PRICING["claude-sonnet-4-6"]
-    if "haiku" in m:
-        return PRICING["claude-haiku-4-5"]
-    return None
 
 def calc_cost(model, inp, out, cache_read, cache_creation):
     p = get_pricing(model)
     if not p:
         return 0.0
     return (
-        inp          * p["input"]  / 1_000_000 +
-        out          * p["output"] / 1_000_000 +
-        cache_read   * p["input"]  * 0.10 / 1_000_000 +
-        cache_creation * p["input"] * 1.25 / 1_000_000
+        inp            * p["input"]       / 1_000_000 +
+        out            * p["output"]      / 1_000_000 +
+        cache_read     * p["cache_read"]  / 1_000_000 +
+        cache_creation * p["cache_write"] / 1_000_000
     )
 
 def fmt(n):
@@ -276,6 +251,9 @@ def cmd_dashboard(projects_dir=None):
         port = int(os.environ.get("PORT", "8080"))
     except ValueError:
         print(f"⚠️  Invalid PORT value '{os.environ.get('PORT')}' — defaulting to 8080.")
+        port = 8080
+    if not (1 <= port <= 65535):
+        print(f"⚠️  PORT {port} out of valid range — defaulting to 8080.")
         port = 8080
 
     def open_browser():
