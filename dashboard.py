@@ -8,7 +8,7 @@ import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
-from scanner import PRICING
+from scanner import PRICING, get_effective_pricing
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
@@ -150,6 +150,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":   sessions_all,
         "hourly_data":    hourly_data,
         "dow_data":       dow_data,
+        "pricing":        get_effective_pricing(),
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -392,14 +393,18 @@ function isBillable(model) {
 
 function getPricing(model) {
   if (!model) return null;
-  if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key)) return PRICING[key];
+  // Prefer live rates fetched server-side; fall back to the built-in table.
+  const table = (rawData && rawData.pricing) ? rawData.pricing : PRICING;
+  if (table[model]) return table[model];
+  // Longest (most specific) prefix wins — the fetched table has many keys.
+  const keys = Object.keys(table).sort((a, b) => b.length - a.length);
+  for (const key of keys) {
+    if (model.startsWith(key)) return table[key];
   }
   const m = model.toLowerCase();
-  if (m.includes('opus'))   return PRICING['claude-opus-4-6'];
-  if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
-  if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
+  if (m.includes('opus'))   return table['claude-opus-4-6'] || null;
+  if (m.includes('sonnet')) return table['claude-sonnet-4-6'] || null;
+  if (m.includes('haiku'))  return table['claude-haiku-4-5'] || null;
   return null;
 }
 

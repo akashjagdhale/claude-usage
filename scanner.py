@@ -6,6 +6,7 @@ import json
 import os
 import glob
 import sqlite3
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -20,22 +21,119 @@ PRICING = {
     "claude-haiku-4-6":  {"input": 1.00,  "output":  5.00, "cache_write": 1.25,  "cache_read": 0.10},
 }
 
+# Live pricing is fetched from the community-maintained LiteLLM dataset, which
+# is machine-readable and tracks Anthropic rates (Anthropic has no official
+# pricing API). Fetched rates are cached locally and overlaid on the built-in
+# PRICING above, which remains the offline fallback.
+PRICING_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
+PRICING_CACHE_PATH = Path.home() / ".claude" / "usage-pricing.json"
+PRICING_FETCH_TIMEOUT = 5  # seconds
+
+_effective_pricing = None  # lazily computed: built-in overlaid with cached/fetched
+
+
+def _pricing_from_litellm(data):
+    """Convert the LiteLLM model_prices JSON into our per-MTok schema."""
+    result = {}
+    for name, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("litellm_provider") != "anthropic" and "claude" not in name.lower():
+            continue
+        try:
+            inp = float(info["input_cost_per_token"]) * 1_000_000
+            out = float(info["output_cost_per_token"]) * 1_000_000
+        except (KeyError, TypeError, ValueError):
+            continue
+        cw = info.get("cache_creation_input_token_cost")
+        cr = info.get("cache_read_input_token_cost")
+        result[name] = {
+            "input":  round(inp, 6),
+            "output": round(out, 6),
+            "cache_write": round(float(cw) * 1_000_000, 6) if cw is not None else round(inp * 1.25, 6),
+            "cache_read":  round(float(cr) * 1_000_000, 6) if cr is not None else round(inp * 0.10, 6),
+        }
+    return result
+
+
+def fetch_pricing(url=PRICING_URL, timeout=PRICING_FETCH_TIMEOUT):
+    """Fetch and parse live pricing. Returns our-schema dict; raises on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "claude-usage"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    prices = _pricing_from_litellm(data)
+    if not prices:
+        raise ValueError("no Anthropic models found in pricing source")
+    return prices
+
+
+def _load_cached_pricing():
+    try:
+        with open(PRICING_CACHE_PATH, encoding="utf-8") as f:
+            cached = json.load(f)
+        if isinstance(cached, dict) and cached:
+            return cached
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def refresh_pricing(verbose=False):
+    """Best-effort fetch of live pricing into the cache. Never raises.
+
+    Returns True if the cache was refreshed from the network, else False.
+    """
+    global _effective_pricing
+    if os.environ.get("CLAUDE_USAGE_DISABLE_PRICING_FETCH"):
+        return False
+    try:
+        fetched = fetch_pricing()
+    except Exception as e:
+        if verbose:
+            print(f"  Pricing fetch failed ({e}); using cached/built-in rates.")
+        return False
+    try:
+        PRICING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(PRICING_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(fetched, f, indent=2, sort_keys=True)
+    except OSError:
+        pass
+    _effective_pricing = {**PRICING, **fetched}
+    if verbose:
+        print(f"  Pricing updated from live source ({len(fetched)} models).")
+    return True
+
+
+def get_effective_pricing():
+    """The active pricing table: built-in rates overlaid with cached/fetched rates."""
+    global _effective_pricing
+    if os.environ.get("CLAUDE_USAGE_DISABLE_PRICING_FETCH"):
+        return PRICING
+    if _effective_pricing is None:
+        _effective_pricing = {**PRICING, **_load_cached_pricing()}
+    return _effective_pricing
+
 
 def get_pricing(model):
     if not model:
         return None
-    if model in PRICING:
-        return PRICING[model]
-    for key in PRICING:
+    pricing = get_effective_pricing()
+    if model in pricing:
+        return pricing[model]
+    # Longest (most specific) prefix wins — the fetched table has many keys.
+    for key in sorted(pricing, key=len, reverse=True):
         if model.startswith(key):
-            return PRICING[key]
+            return pricing[key]
     m = model.lower()
     if "opus" in m:
-        return PRICING["claude-opus-4-6"]
+        return pricing.get("claude-opus-4-6")
     if "sonnet" in m:
-        return PRICING["claude-sonnet-4-6"]
+        return pricing.get("claude-sonnet-4-6")
     if "haiku" in m:
-        return PRICING["claude-haiku-4-5"]
+        return pricing.get("claude-haiku-4-5")
     return None
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 DB_PATH = Path.home() / ".claude" / "usage.db"
@@ -314,6 +412,7 @@ def insert_turns(conn, turns):
 
 
 def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
+    refresh_pricing(verbose=verbose)
     conn = get_db(db_path)
     init_db(conn)
 
